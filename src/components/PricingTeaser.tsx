@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Button } from "./ui/Button";
 import { Card } from "./ui/Card";
-import { Check, Loader2 } from "lucide-react";
+import { Check } from "lucide-react";
 import { Modal } from "./ui/Modal";
 import { LeadForm } from "./LeadForm";
 
