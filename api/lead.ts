@@ -1,8 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
 
-// Initialize Supabase client
-// Service role key is used to bypass RLS policies for insertion
+// Initialize Supabase client (server-side, service role)
 const supabaseUrl = process.env.SUPABASE_URL || '';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
@@ -13,6 +14,20 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
   },
 });
 
+// Upstash rate limit (best-effort)
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+const ratelimit =
+  redisUrl && redisToken
+    ? new Ratelimit({
+        redis: new Redis({ url: redisUrl, token: redisToken }),
+        limiter: Ratelimit.slidingWindow(5, '60 s'), // 5 req / 60s / IP
+        analytics: false,
+        prefix: 'rl:lead',
+      })
+    : null;
+
 function safeTrim(v: unknown, max: number) {
   const s = String(v ?? '').trim();
   return s.length > max ? s.slice(0, max) : s;
@@ -21,8 +36,6 @@ function safeTrim(v: unknown, max: number) {
 async function notifyTelegram(text: string) {
   const token = process.env.TG_BOT_TOKEN;
   const chatId = process.env.TG_CHAT_ID;
-
-  // If not configured - silently skip
   if (!token || !chatId) return;
 
   try {
@@ -37,7 +50,6 @@ async function notifyTelegram(text: string) {
       }),
     });
 
-    // don't fail the whole request because of Telegram
     if (!r.ok) {
       const raw = await r.text().catch(() => '');
       console.error('Telegram notify failed:', r.status, raw.slice(0, 300));
@@ -47,8 +59,41 @@ async function notifyTelegram(text: string) {
   }
 }
 
+async function verifyTurnstile(token: string, remoteip?: string | null) {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+  if (!secret) {
+    // Misconfigured server; treat as hard fail
+    return { ok: false, error: 'Turnstile not configured' as const };
+  }
+
+  const body = new URLSearchParams();
+  body.set('secret', secret);
+  body.set('response', token);
+  if (remoteip) body.set('remoteip', remoteip);
+
+  const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  const raw = await r.text();
+  let data: any = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: 'Turnstile invalid response' as const };
+  }
+
+  if (!r.ok || !data?.success) {
+    return { ok: false, error: 'Turnstile failed' as const, codes: data?.['error-codes'] };
+  }
+
+  return { ok: true as const };
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS Handling (for local dev mostly, Vercel handles prod typically)
+  // CORS (mainly for local; Vercel prod typically doesn't need it)
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
@@ -67,12 +112,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { name, contact, reason, message, company } = req.body ?? {};
+    const { name, contact, reason, message, company, turnstileToken } = req.body ?? {};
 
-    // Honeypot check
+    // IP Extraction
+    const ip =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.socket.remoteAddress ||
+      null;
+
+    // Rate limit (best-effort). If not configured, skip.
+    if (ratelimit && ip) {
+      const rl = await ratelimit.limit(ip);
+      if (!rl.success) {
+        return res.status(429).json({ ok: false, error: 'Too many requests. Try again later.' });
+      }
+    }
+
+    // Honeypot (bots) — pretend success, do nothing
     if (company) {
-      // Silently succeed for bots
       return res.status(200).json({ ok: true });
+    }
+
+    // Turnstile required
+    const ts = safeTrim(turnstileToken, 2048);
+    if (!ts) {
+      return res.status(400).json({ ok: false, error: 'Bot protection required' });
+    }
+
+    const verify = await verifyTurnstile(ts, ip);
+    if (!verify.ok) {
+      console.error('Turnstile verification failed:', verify);
+      return res.status(403).json({ ok: false, error: 'Bot protection failed' });
     }
 
     // Normalize + clamp
@@ -82,21 +152,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const m = safeTrim(message, 1200);
 
     // Validation
-    if (!n || n.length < 2) {
-      return res.status(400).json({ ok: false, error: 'Invalid name' });
-    }
-    if (!c || c.length < 3) {
-      return res.status(400).json({ ok: false, error: 'Invalid contact' });
-    }
-    if (!r) {
-      return res.status(400).json({ ok: false, error: 'Reason required' });
-    }
-
-    // IP Extraction
-    const ip =
-      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-      req.socket.remoteAddress ||
-      null;
+    if (!n || n.length < 2) return res.status(400).json({ ok: false, error: 'Invalid name' });
+    if (!c || c.length < 3) return res.status(400).json({ ok: false, error: 'Invalid contact' });
+    if (!r) return res.status(400).json({ ok: false, error: 'Reason required' });
 
     const userAgent = String(req.headers['user-agent'] || 'unknown');
 
@@ -115,7 +173,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ ok: false, error: 'Database error' });
     }
 
-    // Telegram notification (best-effort, does not affect client success)
+    // Telegram notification (best-effort)
     const tgText = [
       '🆕 Новая заявка',
       `Имя: ${n}`,
