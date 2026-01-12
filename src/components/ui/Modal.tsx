@@ -1,7 +1,6 @@
 import * as React from "react";
 import { X } from "lucide-react";
 import { createPortal } from "react-dom";
-import { cn } from "@/lib/cn";
 
 interface ModalProps {
   isOpen: boolean;
