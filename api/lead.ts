@@ -13,6 +13,40 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
   },
 });
 
+function safeTrim(v: unknown, max: number) {
+  const s = String(v ?? '').trim();
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+async function notifyTelegram(text: string) {
+  const token = process.env.TG_BOT_TOKEN;
+  const chatId = process.env.TG_CHAT_ID;
+
+  // If not configured - silently skip
+  if (!token || !chatId) return;
+
+  try {
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true,
+      }),
+    });
+
+    // don't fail the whole request because of Telegram
+    if (!r.ok) {
+      const raw = await r.text().catch(() => '');
+      console.error('Telegram notify failed:', r.status, raw.slice(0, 300));
+    }
+  } catch (e) {
+    console.error('Telegram notify exception:', e);
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // CORS Handling (for local dev mostly, Vercel handles prod typically)
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -33,50 +67,69 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { name, contact, reason, message, company } = req.body;
+    const { name, contact, reason, message, company } = req.body ?? {};
 
     // Honeypot check
     if (company) {
-      // Silently fail for bots
+      // Silently succeed for bots
       return res.status(200).json({ ok: true });
     }
 
+    // Normalize + clamp
+    const n = safeTrim(name, 120);
+    const c = safeTrim(contact, 180);
+    const r = safeTrim(reason, 60);
+    const m = safeTrim(message, 1200);
+
     // Validation
-    if (!name || name.length < 2 || name.length > 120) {
+    if (!n || n.length < 2) {
       return res.status(400).json({ ok: false, error: 'Invalid name' });
     }
-    if (!contact || contact.length < 3 || contact.length > 180) {
+    if (!c || c.length < 3) {
       return res.status(400).json({ ok: false, error: 'Invalid contact' });
     }
-    if (!reason || reason.length > 60) {
+    if (!r) {
       return res.status(400).json({ ok: false, error: 'Reason required' });
-    }
-    if (message && message.length > 1200) {
-      return res.status(400).json({ ok: false, error: 'Message too long' });
     }
 
     // IP Extraction
-    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.socket.remoteAddress;
-    const userAgent = req.headers['user-agent'] || 'unknown';
+    const ip =
+      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.socket.remoteAddress ||
+      null;
+
+    const userAgent = String(req.headers['user-agent'] || 'unknown');
 
     // DB Insert
     const { error } = await supabase.from('leads').insert({
-      name,
-      contact,
-      reason,
-      message,
+      name: n,
+      contact: c,
+      reason: r,
+      message: m || null,
       ip,
       user_agent: userAgent,
     });
 
     if (error) {
       console.error('Supabase Error:', error);
-      // Return generic error to client
       return res.status(500).json({ ok: false, error: 'Database error' });
     }
 
-    return res.status(200).json({ ok: true });
+    // Telegram notification (best-effort, does not affect client success)
+    const tgText = [
+      '🆕 Новая заявка',
+      `Имя: ${n}`,
+      `Контакт: ${c}`,
+      `Причина: ${r}`,
+      m ? `Сообщение: ${m}` : null,
+      ip ? `IP: ${ip}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
 
+    await notifyTelegram(tgText);
+
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('API Error:', err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });
