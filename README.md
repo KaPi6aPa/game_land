@@ -102,9 +102,9 @@ User
 
 | Section | Screenshot |
 |---------|-----------|
-| **FAQ Section** | ![FAQ](docs/screens/01-faq.png) |
-| **Application Forms** | ![Forms](docs/screens/02-forms.png) |
-| **Success State** | ![Forms Ready](docs/screens/03-formsready.png) |
+| **FAQ Section** | ![FAQ](docs/screens/faq.png) |
+| **Application Forms** | ![Forms](docs/screens/forms.png) |
+| **Success State** | ![Forms Ready](docs/screens/formsready.png) |
 | **Homepage** | ![Home](docs/screens/home.png) |
 | **Telegram Notifications** | ![Telegram](docs/screens/TG.png) |
 
